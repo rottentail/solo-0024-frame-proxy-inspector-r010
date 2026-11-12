@@ -12,6 +12,7 @@ from frame_proxy.domain.models import ClipRecord
 from frame_proxy.domain.policies import validate_clip_id
 from frame_proxy.domain.transitions import transition_clip
 from frame_proxy.media.avi import probe_avi
+from frame_proxy.media.source import as_media_source
 from frame_proxy.storage.repository import FileRepository
 
 
@@ -34,7 +35,7 @@ class ClipService:
                 },
             )
 
-        descriptor = probe_avi(payload)
+        descriptor = probe_avi(as_media_source(payload))
         if descriptor.width > self._settings.max_frame_width:
             raise MediaValidationError(
                 "clip width exceeds the configured limit",

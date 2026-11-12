@@ -150,6 +150,8 @@ class InspectionRecord:
     error_message: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
+    #: Transient per-task working-set evidence; never persisted.
+    working_set_evidence: dict[str, int] | None = field(default=None, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -228,6 +230,8 @@ class ContactSheetRecord:
     error_message: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
+    #: Transient per-task working-set evidence; never persisted.
+    working_set_evidence: dict[str, int] | None = field(default=None, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {

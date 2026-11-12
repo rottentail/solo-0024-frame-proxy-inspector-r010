@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from frame_proxy.domain.errors import ErrorCode, MediaValidationError
+from frame_proxy.media.source import MediaSource, MemorySource
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,18 +35,13 @@ def _fail(message: str, code: ErrorCode = ErrorCode.MEDIA_FORMAT) -> None:
     raise MediaValidationError(message, code=code)
 
 
-def _require_bounds(buffer: bytes, offset: int, size: int) -> None:
-    if offset < 0 or size < 0 or offset + size > len(buffer):
-        _fail("AVI chunk extends beyond the payload")
-
-
-def _iter_chunks(buffer: bytes, start: int, end: int) -> Iterator[_Chunk]:
+def _iter_chunks(source: MediaSource, start: int, end: int) -> Iterator[_Chunk]:
     cursor = start
     while cursor < end:
         if cursor + 8 > end:
             _fail("AVI chunk header is truncated")
-        tag = buffer[cursor : cursor + 4]
-        size = struct.unpack_from("<I", buffer, cursor + 4)[0]
+        tag = source.read_at(cursor, 4)
+        size = source.uint32_at(cursor + 4)
         payload_offset = cursor + 8
         payload_end = payload_offset + size
         if payload_end > end:
@@ -58,30 +54,36 @@ def _iter_chunks(buffer: bytes, start: int, end: int) -> Iterator[_Chunk]:
 
 
 def _find_chunk(
-    buffer: bytes,
+    source: MediaSource,
     start: int,
     end: int,
     wanted: bytes,
 ) -> _Chunk | None:
-    for chunk in _iter_chunks(buffer, start, end):
+    for chunk in _iter_chunks(source, start, end):
         if chunk.tag == wanted:
             return chunk
     return None
 
 
-def _list_payload(buffer: bytes, chunk: _Chunk, list_type: bytes) -> tuple[int, int]:
+def _list_payload(
+    source: MediaSource, chunk: _Chunk, list_type: bytes
+) -> tuple[int, int]:
     if chunk.payload_size < 4:
         _fail("AVI list is missing its type")
-    actual = buffer[chunk.payload_offset : chunk.payload_offset + 4]
+    actual = source.read_at(chunk.payload_offset, 4)
     if actual != list_type:
         _fail(f"expected AVI list {list_type!r}, found {actual!r}")
     return chunk.payload_offset + 4, chunk.payload_offset + chunk.payload_size
 
 
-def _parse_avih(buffer: bytes, chunk: _Chunk) -> tuple[int, int, int, int]:
+def _parse_avih(
+    source: MediaSource, chunk: _Chunk
+) -> tuple[int, int, int, int]:
     if chunk.payload_size < 56:
         _fail("AVI main header is too short")
-    fields = struct.unpack_from("<14I", buffer, chunk.payload_offset)
+    fields = struct.unpack(
+        "<14I", source.read_at(chunk.payload_offset, 56)
+    )
     total_frames = fields[4]
     streams = fields[6]
     width = fields[8]
@@ -93,10 +95,15 @@ def _parse_avih(buffer: bytes, chunk: _Chunk) -> tuple[int, int, int, int]:
     return total_frames, streams, width, height
 
 
-def _parse_strh(buffer: bytes, chunk: _Chunk) -> tuple[int, int, int, int]:
+def _parse_strh(
+    source: MediaSource, chunk: _Chunk
+) -> tuple[int, int, int, int]:
     if chunk.payload_size < 56:
         _fail("AVI stream header is too short")
-    fields = struct.unpack_from("<4s4sIHHIIIIIIIIhhhh", buffer, chunk.payload_offset)
+    fields = struct.unpack_from(
+        "<4s4sIHHIIIIIIIIhhhh",
+        source.read_at(chunk.payload_offset, 56),
+    )
     stream_type = fields[0]
     scale = fields[6]
     rate = fields[7]
@@ -111,12 +118,14 @@ def _parse_strh(buffer: bytes, chunk: _Chunk) -> tuple[int, int, int, int]:
 
 
 def _parse_strf(
-    buffer: bytes,
+    source: MediaSource,
     chunk: _Chunk,
 ) -> tuple[int, int, int, int, int, int]:
     if chunk.payload_size < 40:
         _fail("AVI bitmap header is too short")
-    fields = struct.unpack_from("<IiiHHIIiiII", buffer, chunk.payload_offset)
+    fields = struct.unpack_from(
+        "<IiiHHIIiiII", source.read_at(chunk.payload_offset, 40)
+    )
     header_size = fields[0]
     width = fields[1]
     signed_height = fields[2]
@@ -142,44 +151,46 @@ def _simplify_ratio(numerator: int, denominator: int) -> tuple[int, int]:
     return numerator // divisor, denominator // divisor
 
 
-def probe_avi(buffer: bytes) -> AviDescriptor:
-    if len(buffer) < 12:
+def probe_avi(source: MediaSource | bytes) -> AviDescriptor:
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        source = MemorySource(bytes(source))
+    if len(source) < 12:
         _fail("payload is too short to be an AVI container")
-    if buffer[0:4] != b"RIFF" or buffer[8:12] != b"AVI ":
+    if source.read_at(0, 4) != b"RIFF" or source.read_at(8, 4) != b"AVI ":
         _fail("payload must be a RIFF/AVI container")
-    riff_size = struct.unpack_from("<I", buffer, 4)[0]
-    if riff_size + 8 != len(buffer):
+    riff_size = source.uint32_at(4)
+    if riff_size + 8 != len(source):
         _fail(
             "RIFF size does not match the uploaded byte count",
             code=ErrorCode.MEDIA_BOUNDS,
         )
 
-    hdrl = _find_chunk(buffer, 12, len(buffer), b"LIST")
+    hdrl = _find_chunk(source, 12, len(source), b"LIST")
     if hdrl is None:
         _fail("AVI header list is missing")
-    hdrl_start, hdrl_end = _list_payload(buffer, hdrl, b"hdrl")
+    hdrl_start, hdrl_end = _list_payload(source, hdrl, b"hdrl")
 
-    avih = _find_chunk(buffer, hdrl_start, hdrl_end, b"avih")
+    avih = _find_chunk(source, hdrl_start, hdrl_end, b"avih")
     if avih is None:
         _fail("AVI main header chunk is missing")
-    total_frames, _, avih_width, avih_height = _parse_avih(buffer, avih)
+    total_frames, _, avih_width, avih_height = _parse_avih(source, avih)
 
     stream_list: _Chunk | None = None
-    for chunk in _iter_chunks(buffer, hdrl_start, hdrl_end):
+    for chunk in _iter_chunks(source, hdrl_start, hdrl_end):
         if chunk.tag == b"LIST":
-            start, end = _list_payload(buffer, chunk, b"strl")
-            if _find_chunk(buffer, start, end, b"strh") is not None:
+            start, end = _list_payload(source, chunk, b"strl")
+            if _find_chunk(source, start, end, b"strh") is not None:
                 stream_list = chunk
                 break
     if stream_list is None:
         _fail("AVI video stream list is missing")
-    stream_start, stream_end = _list_payload(buffer, stream_list, b"strl")
+    stream_start, stream_end = _list_payload(source, stream_list, b"strl")
 
-    strh = _find_chunk(buffer, stream_start, stream_end, b"strh")
-    strf = _find_chunk(buffer, stream_start, stream_end, b"strf")
+    strh = _find_chunk(source, stream_start, stream_end, b"strh")
+    strf = _find_chunk(source, stream_start, stream_end, b"strf")
     if strh is None or strf is None:
         _fail("AVI stream headers are incomplete")
-    scale, rate, stream_length, _flags = _parse_strh(buffer, strh)
+    scale, rate, stream_length, _flags = _parse_strh(source, strh)
     (
         width,
         height,
@@ -187,7 +198,7 @@ def probe_avi(buffer: bytes) -> AviDescriptor:
         _compression,
         image_size,
         signed_height,
-    ) = _parse_strf(buffer, strf)
+    ) = _parse_strf(source, strf)
 
     if width != avih_width or height != avih_height:
         _fail("AVI main and stream dimensions disagree")
@@ -200,18 +211,18 @@ def probe_avi(buffer: bytes) -> AviDescriptor:
         _fail("AVI bitmap image size does not match frame geometry")
 
     movi: _Chunk | None = None
-    for chunk in _iter_chunks(buffer, 12, len(buffer)):
+    for chunk in _iter_chunks(source, 12, len(source)):
         if chunk.tag == b"LIST":
-            actual = buffer[chunk.payload_offset : chunk.payload_offset + 4]
+            actual = source.read_at(chunk.payload_offset, 4)
             if actual == b"movi":
                 movi = chunk
                 break
     if movi is None:
         _fail("AVI media list is missing")
-    movi_start, movi_end = _list_payload(buffer, movi, b"movi")
+    movi_start, movi_end = _list_payload(source, movi, b"movi")
 
     offsets: list[int] = []
-    for chunk in _iter_chunks(buffer, movi_start, movi_end):
+    for chunk in _iter_chunks(source, movi_start, movi_end):
         if chunk.tag == b"JUNK":
             continue
         if chunk.tag != b"00db":
@@ -239,4 +250,3 @@ def probe_avi(buffer: bytes) -> AviDescriptor:
         frame_offsets=tuple(offsets),
         handler="DIB",
     )
-

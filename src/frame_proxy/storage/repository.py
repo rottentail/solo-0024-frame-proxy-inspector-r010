@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,12 @@ from frame_proxy.domain.models import (
     ContactSheetRecord,
     InspectionRecord,
 )
-from frame_proxy.storage.atomic import atomic_write_bytes, atomic_write_json
+from frame_proxy.media.source import PinnedClipMedia
+from frame_proxy.storage.atomic import (
+    atomic_write_bytes,
+    atomic_write_json,
+    publish_bytes,
+)
 from frame_proxy.storage.lock import FileKeyLock
 from frame_proxy.storage.paths import DataPaths
 
@@ -74,16 +80,26 @@ class FileRepository:
                 details={"clip_id": clip_id},
             )
 
-    def get_clip_media(self, clip_id: str) -> bytes:
-        path = self.paths.clip_media(clip_id)
-        try:
-            return path.read_bytes()
-        except FileNotFoundError:
+    def open_clip_media(self, clip: ClipRecord) -> PinnedClipMedia:
+        """Open registered clip media for one bounded processing task.
+
+        The returned pin verifies the registered digest and size on entry and
+        again before commit, so a replaced or rewritten source file can never
+        be combined into a successful artifact.
+        """
+        path = self.paths.clip_media(clip.clip_id)
+        if not path.exists():
             raise NotFoundError(
                 ErrorCode.CLIP_NOT_FOUND,
                 "clip media was not found",
-                details={"clip_id": clip_id},
+                details={"clip_id": clip.clip_id},
             )
+        return PinnedClipMedia(
+            path,
+            clip_id=clip.clip_id,
+            expected_digest=clip.digest,
+            expected_size=clip.byte_size,
+        )
 
     def create_inspection(self, record: InspectionRecord) -> None:
         path = self.paths.inspection_record(record.inspection_id)
@@ -171,6 +187,44 @@ class FileRepository:
             artifact_visible = False
             try:
                 atomic_write_bytes(artifact_path, artifact)
+                artifact_visible = True
+                atomic_write_json(path, record.as_dict())
+            except Exception:
+                if artifact_visible:
+                    try:
+                        artifact_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
+
+    def commit_contact_sheet_from_scratch(
+        self,
+        record: ContactSheetRecord,
+        scratch_artifact: Path,
+    ) -> None:
+        """Publish a PPM already spooled in the task's bounded scratch area.
+
+        The scratch file is renamed into place without a second full copy, so
+        temporary disk usage never exceeds the task's scratch budget.  The
+        ready record is only written after the artifact rename is durable.
+        """
+        path = self.paths.contact_sheet_record(record.sheet_id)
+        artifact_path = self.paths.contact_sheet_artifact(
+            record.sheet_id,
+            record.artifact_name,
+        )
+        with FileKeyLock(
+            self.paths.lock_path("contact-sheet", record.sheet_id)
+        ):
+            if not path.exists():
+                raise NotFoundError(
+                    ErrorCode.CONTACT_SHEET_NOT_FOUND,
+                    "contact sheet was not found",
+                    details={"sheet_id": record.sheet_id},
+                )
+            artifact_visible = False
+            try:
+                publish_bytes(scratch_artifact, artifact_path)
                 artifact_visible = True
                 atomic_write_json(path, record.as_dict())
             except Exception:

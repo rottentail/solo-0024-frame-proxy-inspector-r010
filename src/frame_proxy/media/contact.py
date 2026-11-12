@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 from frame_proxy.domain.errors import ErrorCode, ValidationError
 from frame_proxy.domain.models import SceneRecord
 from frame_proxy.domain.policies import ContactSheetRequest
+from frame_proxy.media.budget import WorkingSetBudget
 from frame_proxy.media.frames import Frame
 from frame_proxy.media.ppm import encode_ppm
 
@@ -28,6 +30,12 @@ class GridResult:
     digest: str
     plan: GridPlan
     tile_map: tuple[dict[str, int], ...]
+
+
+#: A frame provider decodes one selected frame on demand.  Only the frame
+#: currently being tiled is resident; the previous frame is released before
+#: the next one is decoded, keeping the task at one resident source frame.
+FrameProvider = Callable[[int], Frame]
 
 
 def plan_grid(
@@ -129,10 +137,19 @@ def compose_grid(
     *,
     plan: GridPlan,
     scenes: tuple[SceneRecord, ...],
-    frames: dict[int, Frame],
+    frame_provider: FrameProvider,
     background_rgb: tuple[int, int, int],
     selection: str,
+    budget: WorkingSetBudget | None = None,
 ) -> GridResult:
+    """Compose the grid one tile at a time.
+
+    The canvas is the task's exempt final artifact.  Each scene's source frame
+    is decoded through ``frame_provider``, resized into a tile, copied into
+    the canvas, and released before the next scene is touched, so at most one
+    source RGB frame is resident at any point.  The tile scratch is charged
+    against the task overhead budget.
+    """
     if len(scenes) > plan.columns * plan.rows:
         raise ValueError("scene count exceeds grid capacity")
     pixels = bytearray(background_rgb) * (plan.image_width * plan.image_height)
@@ -142,21 +159,29 @@ def compose_grid(
         row = tile_index // plan.columns
         column = tile_index % plan.columns
         source_frame = _selected_frame(scene, selection)
-        frame = frames.get(source_frame)
-        if frame is None:
+        frame = frame_provider(source_frame)
+        if frame.index != source_frame:
             raise ValueError(f"selected frame {source_frame} was not decoded")
-        tile = _resize_nearest(frame, plan.tile_width, plan.tile_height)
-        left = plan.gutter + column * (plan.tile_width + plan.gutter)
-        top = plan.gutter + row * (plan.tile_height + plan.gutter)
-        _copy_tile(
-            pixels,
-            plan.image_width,
-            tile,
-            left=left,
-            top=top,
-            width=plan.tile_width,
-            height=plan.tile_height,
+        tile_lease = (
+            budget.bytes_lease(plan.tile_width * plan.tile_height * 3)
+            if budget is not None
+            else _NullContext()
         )
+        with tile_lease:
+            tile = _resize_nearest(
+                frame, plan.tile_width, plan.tile_height
+            )
+            left = plan.gutter + column * (plan.tile_width + plan.gutter)
+            top = plan.gutter + row * (plan.tile_height + plan.gutter)
+            _copy_tile(
+                pixels,
+                plan.image_width,
+                tile,
+                left=left,
+                top=top,
+                width=plan.tile_width,
+                height=plan.tile_height,
+            )
         tile_map.append(
             {
                 "tile_index": tile_index,
@@ -179,3 +204,10 @@ def compose_grid(
         tile_map=tuple(tile_map),
     )
 
+
+class _NullContext:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None

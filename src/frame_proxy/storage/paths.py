@@ -24,6 +24,10 @@ class DataPaths:
     def locks(self) -> Path:
         return self.root / "locks"
 
+    @property
+    def scratch(self) -> Path:
+        return self.root / "scratch"
+
     def clip_dir(self, clip_id: str) -> Path:
         return self.clips / clip_id
 
@@ -55,6 +59,7 @@ class DataPaths:
             self.inspections,
             self.contact_sheets,
             self.locks,
+            self.scratch,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

@@ -41,6 +41,18 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
                 pass
 
 
+def publish_bytes(source: Path, destination: Path) -> None:
+    """Atomically publish an already-fsynced scratch file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(os.fspath(source), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(os.fspath(source), os.fspath(destination))
+    _fsync_parent(destination)
+
+
 def atomic_write_json(path: Path, value: dict[str, Any] | list[Any]) -> None:
     payload = json.dumps(
         value,

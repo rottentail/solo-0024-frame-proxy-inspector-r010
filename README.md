@@ -100,6 +100,7 @@ binary P6 with a maximum value of 255.
 ├── contact-sheets/<sheet_id>/
 │   ├── record.json
 │   └── sheet.ppm
+├── scratch/                 # bounded per-task temp area; empty after commit
 └── locks/
 ```
 
@@ -113,7 +114,7 @@ visible.
 src/frame_proxy/
 ├── domain/      records, request rules, and state transitions
 ├── http/        request routing and response mapping
-├── media/       AVI parsing, frame access, fingerprints, and PPM grids
+├── media/       streaming AVI access, budgets, fingerprints, and PPM grids
 ├── service/     workflow orchestration and failure handling
 └── storage/     namespaced files, locks, and atomic writes
 
@@ -121,7 +122,10 @@ tools/
 ├── harness.py
 ├── check_clip_intake.py
 ├── check_shot_index.py
-└── check_contact_sheet.py
+├── check_contact_sheet.py
+├── check_bounded_memory.py
+├── check_source_tamper.py
+└── check_controlled_concurrency.py
 ```
 
 ## Build and workflow checks
@@ -144,14 +148,57 @@ Each check starts a real loopback HTTP server, generates media through the
 production AVI writer, completes the named workflow, and verifies persisted
 state or artifact bytes. Temporary records are removed when the check exits.
 
+## Bounded media working set
+
+Shot indexing and contact sheet composition never load a clip into memory.
+They read the registered AVI through a streaming, identity-pinned media
+source. Beyond the index metadata, scene statistics, and final canvas, each
+media task is independently limited to:
+
+- **1 MiB** of additional resident Python heap, tracked by a per-task
+  `WorkingSetBudget`;
+- **at most two source RGB frames** (both workflows hold just one at a time);
+- **1 MiB** of temporary scratch disk, tracked by a per-task `TaskScratch`.
+
+A process-wide `MediaJobGate` bounds how many media tasks run at once
+(default 2, override with `FRAME_PROXY_MAX_MEDIA_JOBS`), so the aggregate
+media footprint is at most `limit × (1 MiB + two RGB frames)`.
+
+The pin hashes the full clip on open and again immediately before commit, and
+also re-checks the inode identity of the registered path. If the source file
+is replaced or rewritten while a task is in flight, the task fails with a
+stable `frame_decode_failed` (HTTP 422), records a terminal failed job, and
+never publishes a mixed-content artifact.
+
+Reviewable evidence checks (each prints its measured ledger):
+
+```bash
+PYTHONPATH=src:. python3 tools/check_bounded_memory.py
+PYTHONPATH=src:. python3 tools/check_source_tamper.py
+PYTHONPATH=src:. python3 tools/check_controlled_concurrency.py
+```
+
+- `check_bounded_memory` asserts the frame/overhead/scratch limits on a
+  large-frame clip and reports the tracemalloc peak.
+- `check_source_tamper` mutates the source in place and by rename mid-task and
+  confirms both workflows reject it while an untampered control still
+  succeeds.
+- `check_controlled_concurrency` saturates the job gate and confirms the
+  active count never exceeds the limit while every job yields identical
+  results.
+
+
 ## Environment variables
 
 | Name | Default | Purpose |
 | --- | --- | --- |
 | `FRAME_PROXY_DATA_DIR` | `.frame-proxy-data` | durable data root |
+| `FRAME_PROXY_MAX_MEDIA_JOBS` | `2` | max concurrent media processing tasks (1–16) |
 
 Clip, upload, JSON, frame dimension, frame count, and contact sheet limits are
-declared in `src/frame_proxy/config.py`.
+declared in `src/frame_proxy/config.py`. The per-task 1 MiB overhead/scratch
+caps and the two-frame limit are declared in
+`src/frame_proxy/media/budget.py`.
 
 ## Input boundary
 
